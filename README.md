@@ -1,5 +1,22 @@
 # llama.cpp
 
+> **This is a fork with AMD Metal GPU support for any Mac.**
+>
+> Upstream llama.cpp produces garbage output on Intel Macs with AMD Radeon GPUs. We maintain patches that fix Metal GPU acceleration on these machines.
+>
+> **What you get:**
+> - **AMD Radeon GPU support** — corrected Metal compute kernels for discrete AMD GPUs on Intel Macs (Radeon Pro 5300M, 5500M, 5600M, W6900X, etc.)
+> - **1.9x faster** than the old iRon-Llama fork (111 vs 59 t/s on Qwen 0.5B Q4_K_M)
+> - **All upstream features** — latest master with GGUF v3, IQ/MXFP4 quantization, Gemma 3, Qwen2VL, server web UI, Jinja templating
+> - **Apple Silicon** works identically to upstream (patches only activate on non-Apple GPUs)
+> - **CPU-only** falls back to Accelerate BLAS
+>
+> Branches:
+> - `main` / `dev` — latest upstream master + AMD Metal patches (current)
+> - `main-legacy` — old b6123 + iRon-Llama patches (archived)
+>
+> ⚡ **One command install:** `curl -sSL https://raw.githubusercontent.com/AlastorMordrek/llama-metal/main/install.sh | bash`
+
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
