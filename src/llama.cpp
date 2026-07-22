@@ -196,6 +196,28 @@ static struct llama_model * llama_model_load_from_file_impl(
         }
     }
 
+    // respect GGML_METAL_DEVICE_INDEX when selecting Metal GPU for layer offloading
+    {
+        const char * metal_idx_env = getenv("GGML_METAL_DEVICE_INDEX");
+        if (metal_idx_env) {
+            int target_idx = atoi(metal_idx_env);
+            std::vector<ggml_backend_dev_t> filtered;
+            int metal_count = 0;
+            for (auto * dev : model->devices) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                if (ggml_backend_reg_name(reg) == std::string("Metal")) {
+                    if (metal_count == target_idx) {
+                        filtered.push_back(dev);
+                    }
+                    metal_count++;
+                } else {
+                    filtered.push_back(dev);
+                }
+            }
+            model->devices = filtered;
+        }
+    }
+
     // if using single GPU mode, remove all except the main GPU
     if (params.split_mode == LLAMA_SPLIT_MODE_NONE) {
         if (params.main_gpu < 0) {
