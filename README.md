@@ -1,5 +1,20 @@
 # llama-metal — llama.cpp with Metal GPU acceleration for any Mac
 
+> **⚠️ LEGACY BRANCH — `main-legacy`**
+> 
+> This branch is **frozen** for archival. It contains llama.cpp at tag **b6123** (June 2025) with iRon-Llama AMD Metal patches and packaging scripts (install.sh, uninstall.sh).
+>
+> **The current `main` branch** has been replaced with llama.cpp **master** (July 2026, commit `1f66c3ce1`) plus our own AMD Metal patches. The new main branch:
+> - Supports GGUF v3 natively (no patch needed)
+> - Supports IQ and MXFP4 quantization formats (IQ1_S through IQ4_XS)
+> - Supports Gemma 3, Qwen2VL, Qwen3VL, MiniCPM-V, Llama 4, diffusion, TTS
+> - 1.9x faster than this legacy branch on the same model
+> - Includes server web UI, Jinja templating, speculative decoding
+>
+> Use the current `main` branch for all new work. This `main-legacy` branch is kept for reference and rollback only.
+>
+> ---
+
 One command to get llama.cpp running with Metal GPU on Apple Silicon or Intel + AMD.
 
 ```
