@@ -8306,6 +8306,8 @@ void kernel_mul_mv_q4_K_f32_impl(
         uint3  tgpig,
         ushort tiisg,
         ushort sgitg) {
+    (void) shmem;
+
     const short NSG = FC_mul_mv_nsg;
 
     constexpr uint16_t kmask1 = 0x3f3f;
@@ -8334,57 +8336,90 @@ void kernel_mul_mv_q4_K_f32_impl(
     device const block_q4_K * x = (device const block_q4_K *) (src0 + offset0);
     device const float      * y = (device const float      *) (src1 + offset1);
 
-    float yl[16];
-    float yh[16];
-
-    float sumf[nr0]={0.f};
+    float sumf[nr0] = { 0.0f };
 
     device const float * y4 = y + ix * QK_K + 64 * iq + 8 * ir;
 
     uint16_t sc16[4];
-    thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
 
     for (int ib = ix; ib < nb; ib += 4) {
-        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+        float2 yL0[4], yL1[4], yH0[4], yH1[4];
 
-        for (short i = 0; i < 8; ++i) {
-            yl[i+0] = y4[i+  0]; sumy[0] += yl[i+0];
-            yl[i+8] = y4[i+ 32]; sumy[1] += yl[i+8];
-            yh[i+0] = y4[i+128]; sumy[2] += yh[i+0];
-            yh[i+8] = y4[i+160]; sumy[3] += yh[i+8];
+        float sumy0 = 0.0f;
+        float sumy1 = 0.0f;
+        float sumy2 = 0.0f;
+        float sumy3 = 0.0f;
+
+        for (short p = 0; p < 4; ++p) {
+            const float2 a0 = float2(y4[2*p + 0], y4[2*p + 1]);
+            const float2 a1 = float2(y4[32 + 2*p + 0], y4[32 + 2*p + 1]);
+            const float2 b0 = float2(y4[128 + 2*p + 0], y4[128 + 2*p + 1]);
+            const float2 b1 = float2(y4[160 + 2*p + 0], y4[160 + 2*p + 1]);
+
+            yL0[p] = a0;
+            yL1[p] = a1;
+            yH0[p] = b0;
+            yH1[p] = b1;
+
+            sumy0 += a0.x + a0.y;
+            sumy1 += a1.x + a1.y;
+            sumy2 += b0.x + b0.y;
+            sumy3 += b1.x + b1.y;
         }
 
         device const uint16_t * sc = (device const uint16_t *)x[ib].scales + iq;
         device const uint16_t * q1 = (device const uint16_t *)x[ib].qs + 16 * iq + 4 * ir;
         device const half     * dh = &x[ib].d;
 
-        for (short row = 0; row < nr0; row++) {
+        for (short row = 0; row < nr0; ++row) {
             sc16[0] = sc[0] & kmask1;
             sc16[1] = sc[2] & kmask1;
             sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
             sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
 
+            thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
+
+            const float s0 = (float)sc8[0];
+            const float s1 = (float)sc8[1];
+            const float s2 = (float)sc8[2];
+            const float s3 = (float)sc8[3];
+            const float s4 = (float)sc8[4];
+            const float s5 = (float)sc8[5];
+            const float s6 = (float)sc8[6];
+            const float s7 = (float)sc8[7];
+
             device const uint16_t * q2 = q1 + 32;
 
-            float4 acc1 = {0.f, 0.f, 0.f, 0.f};
-            float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+            float a_lo = 0.0f;
+            float a_hi = 0.0f;
+            float b_lo = 0.0f;
+            float b_hi = 0.0f;
 
-            FOR_UNROLL (short i = 0; i < 4; ++i) {
-                acc1[0] += yl[2*i + 0] * (q1[i] & 0x000F);
-                acc1[1] += yl[2*i + 1] * (q1[i] & 0x0F00);
-                acc1[2] += yl[2*i + 8] * (q1[i] & 0x00F0);
-                acc1[3] += yl[2*i + 9] * (q1[i] & 0xF000);
-                acc2[0] += yh[2*i + 0] * (q2[i] & 0x000F);
-                acc2[1] += yh[2*i + 1] * (q2[i] & 0x0F00);
-                acc2[2] += yh[2*i + 8] * (q2[i] & 0x00F0);
-                acc2[3] += yh[2*i + 9] * (q2[i] & 0xF000);
+            for (short i = 0; i < 4; ++i) {
+                const uint qlu = (uint)q1[i];
+                const uint qhu = (uint)q2[i];
+
+                const float2 n01 = float2((float)((qlu >>  0) & 0xF),
+                                          (float)((qlu >>  8) & 0xF));
+                const float2 n23 = float2((float)((qlu >>  4) & 0xF),
+                                          (float)((qlu >> 12) & 0xF));
+
+                const float2 m01 = float2((float)((qhu >>  0) & 0xF),
+                                          (float)((qhu >>  8) & 0xF));
+                const float2 m23 = float2((float)((qhu >>  4) & 0xF),
+                                          (float)((qhu >> 12) & 0xF));
+
+                a_lo += dot(yL0[i], n01);
+                a_hi += dot(yL1[i], n23);
+                b_lo += dot(yH0[i], m01);
+                b_hi += dot(yH1[i], m23);
             }
 
-            sumf[row] += dh[0] * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
-                                  (acc1[2] + 1.f/256.f * acc1[3]) * sc8[1] * 1.f/16.f +
-                                  (acc2[0] + 1.f/256.f * acc2[1]) * sc8[4] +
-                                  (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -
-                         dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+            const float dall = (float)dh[0];
+            const float dmin = (float)dh[1];
+
+            sumf[row] += dall * (a_lo * s0 + a_hi * s1 + b_lo * s4 + b_hi * s5)
+                       - dmin * (sumy0 * s2 + sumy1 * s3 + sumy2 * s6 + sumy3 * s7);
 
             q1 += args.nb01/2;
             sc += args.nb01/2;
@@ -8397,7 +8432,7 @@ void kernel_mul_mv_q4_K_f32_impl(
     device float * dst_f32 = (device float *) dst + (int64_t)im*args.ne0*args.ne1 + (int64_t)r1*args.ne0;
 
     for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
-        float sum_all = simd_sum(sumf[row]);
+        const float sum_all = simd_sum(sumf[row]);
         if (tiisg == 0) {
             dst_f32[first_row + row] = sum_all;
         }
@@ -8558,6 +8593,7 @@ void kernel_mul_mv_q6_K_f32_impl(
         uint3  tgpig,
         ushort tiisg,
         ushort sgitg) {
+
     const short NSG = FC_mul_mv_nsg;
 
     constexpr uint8_t kmask1 = 0x03;
@@ -8565,7 +8601,7 @@ void kernel_mul_mv_q6_K_f32_impl(
     constexpr uint8_t kmask3 = 0x30;
     constexpr uint8_t kmask4 = 0xC0;
 
-    const int nb = args.ne00/QK_K;
+    const int nb = args.ne00 / QK_K;
 
     const int r0 = tgpig.x;
     const int r1 = tgpig.y;
@@ -8573,70 +8609,148 @@ void kernel_mul_mv_q6_K_f32_impl(
 
     const int first_row = (r0 * NSG + sgitg) * nr0;
 
-    const uint i12 = im%FC_mul_mv_ne12;
-    const uint i13 = im/FC_mul_mv_ne12;
+    const uint i12 = (uint)(im % FC_mul_mv_ne12);
+    const uint i13 = (uint)(im / FC_mul_mv_ne12);
 
-    const uint64_t offset0 = first_row*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
-    const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
+    const uint64_t offset0 = (uint64_t)first_row * (uint64_t)args.nb01
+                           + (uint64_t)(i12 / FC_mul_mv_r2) * (uint64_t)args.nb02
+                           + (uint64_t)(i13 / FC_mul_mv_r3) * (uint64_t)args.nb03;
 
-    device const block_q6_K * x = (device const block_q6_K *) (src0 + offset0);
-    device const float     * yy = (device const float      *) (src1 + offset1);
+    const uint64_t offset1 = (uint64_t)r1 * (uint64_t)args.nb11
+                           + (uint64_t)i12 * (uint64_t)args.nb12
+                           + (uint64_t)i13 * (uint64_t)args.nb13;
 
-    float sumf[nr0] = { 0.f };
+    device const block_q6_K * x  = (device const block_q6_K *)(src0 + offset0);
+    device const float     * yy = (device const float     *)(src1 + offset1);
 
-    float yl[16];
+    float sumf[nr0] = { 0.0f };
 
-    const short tid = tiisg/2;
-    const short ix  = tiisg%2;
-    const short ip  = tid/8;         // 0 or 1
-    const short il  = tid%8;
-    const short l0  = 4*il;
-    const short is  = 8*ip + l0/16;
+    const short tid = (short)(tiisg / 2);
+    const short ix  = (short)(tiisg % 2);
+    const short ip  = (short)(tid / 8);
+    const short il  = (short)(tid % 8);
+    const short l0  = (short)(4 * il);
+    const short is  = (short)(8 * ip + l0 / 16);
 
-    const short y_offset   = 128*ip + l0;
-    const short q_offset_l =  64*ip + l0;
-    const short q_offset_h =  32*ip + l0;
+    const short y_offset   = (short)(128 * ip + l0);
+    const short q_offset_l = (short)( 64 * ip + l0);
+    const short q_offset_h = (short)( 32 * ip + l0);
 
-    for (int i = ix; i < nb; i += 2) {
+    for (int i = (int)ix; i < nb; i += 2) {
         device const uint8_t * q1 = x[i].ql + q_offset_l;
         device const uint8_t * q2 = q1 + 32;
         device const uint8_t * qh = x[i].qh + q_offset_h;
         device const int8_t  * sc = x[i].scales + is;
         device const half    * dh = &x[i].d;
 
-        device const float * y = yy + i * QK_K + y_offset;
+        device const float * y = yy + (int)(i * QK_K + y_offset);
 
-        for (short l = 0; l < 4; ++l) {
-            yl[4*l + 0] = y[l +  0];
-            yl[4*l + 1] = y[l + 32];
-            yl[4*l + 2] = y[l + 64];
-            yl[4*l + 3] = y[l + 96];
-        }
+        float sc0 = (float)sc[0];
+        float sc2 = (float)sc[2];
+        float sc4 = (float)sc[4];
+        float sc6 = (float)sc[6];
+
+        const float4 yv0 = float4(y[0], y[32], y[64], y[96]);
+        const float4 yv1 = float4(y[1], y[33], y[65], y[97]);
+        const float4 yv2 = float4(y[2], y[34], y[66], y[98]);
+        const float4 yv3 = float4(y[3], y[35], y[67], y[99]);
 
         for (short row = 0; row < nr0; ++row) {
-            float4 sums = {0.f, 0.f, 0.f, 0.f};
+            const float dall = (float)dh[0];
 
-            FOR_UNROLL (short l = 0; l < 4; ++l) {
-                sums[0] += yl[4*l + 0] * ((int8_t)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32);
-                sums[1] += yl[4*l + 1] * ((int8_t)((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32);
-                sums[2] += yl[4*l + 2] * ((int8_t)((q1[l]  >> 4) | ((qh[l] & kmask3) << 0)) - 32);
-                sums[3] += yl[4*l + 3] * ((int8_t)((q2[l]  >> 4) | ((qh[l] & kmask4) >> 2)) - 32);
+            float acc_row = 0.0f;
+
+            {
+                const uint q1l = (uint)q1[0];
+                const uint q2l = (uint)q2[0];
+                const uint qhl = (uint)qh[0];
+
+                const int v0 = (int)(( q1l       & 0x0Fu) | ((qhl & (uint)kmask1) << 4)) - 32;
+                const int v1 = (int)(( q2l       & 0x0Fu) | ((qhl & (uint)kmask2) << 2)) - 32;
+                const int v2 = (int)(((q1l >> 4) & 0x0Fu) | ((qhl & (uint)kmask3) << 0)) - 32;
+                const int v3 = (int)(((q2l >> 4) & 0x0Fu) | ((qhl & (uint)kmask4) >> 2)) - 32;
+
+                const float4 qv = float4((float)v0 * sc0,
+                                         (float)v1 * sc2,
+                                         (float)v2 * sc4,
+                                         (float)v3 * sc6);
+
+                acc_row += dot(yv0, qv);
             }
 
-            sumf[row] += dh[0] * (sums[0] * sc[0] + sums[1] * sc[2] + sums[2] * sc[4] + sums[3] * sc[6]);
+            {
+                const uint q1l = (uint)q1[1];
+                const uint q2l = (uint)q2[1];
+                const uint qhl = (uint)qh[1];
+
+                const int v0 = (int)(( q1l       & 0x0Fu) | ((qhl & (uint)kmask1) << 4)) - 32;
+                const int v1 = (int)(( q2l       & 0x0Fu) | ((qhl & (uint)kmask2) << 2)) - 32;
+                const int v2 = (int)(((q1l >> 4) & 0x0Fu) | ((qhl & (uint)kmask3) << 0)) - 32;
+                const int v3 = (int)(((q2l >> 4) & 0x0Fu) | ((qhl & (uint)kmask4) >> 2)) - 32;
+
+                const float4 qv = float4((float)v0 * sc0,
+                                         (float)v1 * sc2,
+                                         (float)v2 * sc4,
+                                         (float)v3 * sc6);
+
+                acc_row += dot(yv1, qv);
+            }
+
+            {
+                const uint q1l = (uint)q1[2];
+                const uint q2l = (uint)q2[2];
+                const uint qhl = (uint)qh[2];
+
+                const int v0 = (int)(( q1l       & 0x0Fu) | ((qhl & (uint)kmask1) << 4)) - 32;
+                const int v1 = (int)(( q2l       & 0x0Fu) | ((qhl & (uint)kmask2) << 2)) - 32;
+                const int v2 = (int)(((q1l >> 4) & 0x0Fu) | ((qhl & (uint)kmask3) << 0)) - 32;
+                const int v3 = (int)(((q2l >> 4) & 0x0Fu) | ((qhl & (uint)kmask4) >> 2)) - 32;
+
+                const float4 qv = float4((float)v0 * sc0,
+                                         (float)v1 * sc2,
+                                         (float)v2 * sc4,
+                                         (float)v3 * sc6);
+
+                acc_row += dot(yv2, qv);
+            }
+
+            {
+                const uint q1l = (uint)q1[3];
+                const uint q2l = (uint)q2[3];
+                const uint qhl = (uint)qh[3];
+
+                const int v0 = (int)(( q1l       & 0x0Fu) | ((qhl & (uint)kmask1) << 4)) - 32;
+                const int v1 = (int)(( q2l       & 0x0Fu) | ((qhl & (uint)kmask2) << 2)) - 32;
+                const int v2 = (int)(((q1l >> 4) & 0x0Fu) | ((qhl & (uint)kmask3) << 0)) - 32;
+                const int v3 = (int)(((q2l >> 4) & 0x0Fu) | ((qhl & (uint)kmask4) >> 2)) - 32;
+
+                const float4 qv = float4((float)v0 * sc0,
+                                         (float)v1 * sc2,
+                                         (float)v2 * sc4,
+                                         (float)v3 * sc6);
+
+                acc_row += dot(yv3, qv);
+            }
+
+            sumf[row] += dall * acc_row;
 
             q1 += args.nb01;
             q2 += args.nb01;
             qh += args.nb01;
             sc += args.nb01;
             dh += args.nb01/2;
+
+            sc0 = (float)sc[0];
+            sc2 = (float)sc[2];
+            sc4 = (float)sc[4];
+            sc6 = (float)sc[6];
         }
     }
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
     for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
-        float sum_all = simd_sum(sumf[row]);
+        const float sum_all = simd_sum(sumf[row]);
         if (tiisg == 0) {
             dst_f32[first_row + row] = sum_all;
         }
