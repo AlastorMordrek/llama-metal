@@ -6,6 +6,8 @@
 
 #import <Foundation/Foundation.h>
 
+#include <stdlib.h>
+
 #import <Metal/Metal.h>
 
 #undef MIN
@@ -24,17 +26,21 @@
 #endif
 
 // create residency sets only on macOS >= 15.0
-#if !TARGET_CPU_X86_64 && TARGET_OS_OSX && __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000 || \
-    TARGET_OS_IOS && __IPHONE_OS_VERSION_MAX_ALLOWED >= 180000 || \
-    TARGET_OS_TV && __TV_OS_VERSION_MAX_ALLOWED >= 180000 || \
-    TARGET_OS_VISION && __VISION_OS_VERSION_MAX_ALLOWED >= 200000
+#if (TARGET_OS_OSX && __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000) || \
+    (TARGET_OS_IOS && __IPHONE_OS_VERSION_MAX_ALLOWED >= 180000) || \
+    (TARGET_OS_TV && __TV_OS_VERSION_MAX_ALLOWED >= 180000) || \
+    (TARGET_OS_VISION && __VISION_OS_VERSION_MAX_ALLOWED >= 200000)
 #define GGML_METAL_HAS_RESIDENCY_SETS 1
 #endif
 
 // globals
 
 // overload of MTLGPUFamilyMetal3 (not available in some environments)
+#if defined(MTLGPUFamilyMetal3)
+static const NSInteger MTLGPUFamilyMetal3_GGML = MTLGPUFamilyMetal3;
+#else
 static const NSInteger MTLGPUFamilyMetal3_GGML = 5001;
+#endif
 
 // initialized in ggml_backend_metal_reg
 static struct ggml_backend_reg    g_ggml_backend_metal_reg;
@@ -47,6 +53,8 @@ static struct ggml_backend_metal_device_context {
     id<MTLDevice>  mtl_device;
     int            mtl_device_ref_count;
     id<MTLLibrary> mtl_library;
+    id<MTLCommandQueue> mtl_queue_copy;
+
 
     NSLock * mtl_lock;
 
@@ -69,6 +77,7 @@ static struct ggml_backend_metal_device_context {
     /*.mtl_device              =*/ nil,
     /*.mtl_device_ref_count    =*/ 0,
     /*.mtl_library             =*/ nil,
+    /*.mtl_queue_copy         =*/ nil,
     /*.mtl_lock                =*/ nil,
     /*.has_simdgroup_reduction =*/ false,
     /*.has_simdgroup_mm        =*/ false,
@@ -91,16 +100,57 @@ static id<MTLDevice> ggml_backend_metal_device_acq(struct ggml_backend_metal_dev
     }
 
     if (ctx->mtl_device == nil) {
-        ctx->mtl_device = MTLCreateSystemDefaultDevice();
+        // Enhanced device selection: allow picking GPU by index and prefer largest working set on multi-GPU systems
+        NSArray * devices = MTLCopyAllDevices();
+        id<MTLDevice> chosen = nil;
+
+        const char * env_idx_c = getenv("GGML_METAL_DEVICE_INDEX");
+        if (devices && [devices count] > 0) {
+            if (env_idx_c) {
+                int env_idx = atoi(env_idx_c);
+                if (env_idx >= 0 && env_idx < (int)[devices count]) {
+                    chosen = [devices objectAtIndex:env_idx];
+                    [chosen retain];
+                }
+            }
+
+            if (chosen == nil) {
+                    // Default: always use first Metal device (GPU 0) to avoid multi-GPU ambiguity on W6800X Duo.
+                    chosen = [devices objectAtIndex:0];
+                    [chosen retain];
+                }
+        }
+
+        if (devices) { [devices release]; }
+
+        if (chosen == nil) {
+            // Fallback: default device
+            ctx->mtl_device = MTLCreateSystemDefaultDevice();
+        } else {
+            ctx->mtl_device = chosen;
+        }
+
+        // queue dedicated to host->private blit copies (model upload); avoids creating a new queue per buffer
+        if (ctx->mtl_queue_copy == nil && ctx->mtl_device != nil) {
+            ctx->mtl_queue_copy = [ctx->mtl_device newCommandQueue];
+        }
+
+        // NOTE: `supportsFamily:` does not strictly guarantee that the corresponding SIMD-group optimized kernels
+        // behave correctly on all macOS GPU drivers. For the targeted Intel + Radeon Pro setup, we default to the
+        // conservative (non-SIMD-group) paths and allow opting-in via environment variables.
+        const bool is_apple_gpu = [ctx->mtl_device supportsFamily:MTLGPUFamilyApple1];
 
         ctx->has_simdgroup_reduction  = [ctx->mtl_device supportsFamily:MTLGPUFamilyApple7];
         ctx->has_simdgroup_reduction |= [ctx->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
+        #if TARGET_OS_OSX
+        ctx->has_simdgroup_reduction |= [ctx->mtl_device supportsFamily:MTLGPUFamilyMac2];
+        #endif
 
-        ctx->has_simdgroup_mm = [ctx->mtl_device supportsFamily:MTLGPUFamilyApple7];
-
-#if defined(GGML_METAL_HAS_RESIDENCY_SETS)
-        ctx->has_residency_sets = getenv("GGML_METAL_NO_RESIDENCY") == nil;
-#endif
+        ctx->has_simdgroup_mm  = [ctx->mtl_device supportsFamily:MTLGPUFamilyApple7];
+        ctx->has_simdgroup_mm |= [ctx->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
+        #if TARGET_OS_OSX
+        ctx->has_simdgroup_mm |= [ctx->mtl_device supportsFamily:MTLGPUFamilyMac2];
+        #endif
 
         ctx->has_bfloat  = [ctx->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
         ctx->has_bfloat |= [ctx->mtl_device supportsFamily:MTLGPUFamilyApple6];
@@ -110,6 +160,43 @@ static id<MTLDevice> ggml_backend_metal_device_acq(struct ggml_backend_metal_dev
 #else
         ctx->use_bfloat = false;
 #endif
+        
+#if TARGET_OS_OSX
+if (!ctx->mtl_device.hasUnifiedMemory) {
+    ctx->has_bfloat = false;
+    ctx->use_bfloat = false;
+
+    // Keep simdgroup_reduction (needed for MUL_MAT support in this backend),
+    // but disable simdgroup_mm to avoid compiling the problematic MM/flash kernels.
+    ctx->has_simdgroup_mm = false;
+}
+#endif
+        
+        // Default policy for Intel macOS + discrete GPUs:
+        // - Disable BF16 paths unless explicitly forced
+        // - Disable SIMD-group fast paths unless explicitly forced
+        // Rationale: incoherent text is consistent with incorrect math paths (BF16 / SIMD-group variants)
+        // on some Radeon drivers; start from conservative correctness-first config.
+        if (!is_apple_gpu) {
+            const bool force_bf16 = getenv("GGML_METAL_FORCE_BF16") != NULL;
+            if (!force_bf16) {
+                ctx->has_bfloat = false;
+                ctx->use_bfloat = false;
+            }
+        }
+        // Radeon/Intel target: force BF16 off (use FP16 paths only)
+        #if TARGET_OS_OSX
+        if (!ctx->mtl_device.hasUnifiedMemory) {
+            ctx->has_bfloat = false;
+            ctx->use_bfloat = false;
+        }
+        #endif
+        
+        
+#if defined(GGML_METAL_HAS_RESIDENCY_SETS)
+        ctx->has_residency_sets = getenv("GGML_METAL_NO_RESIDENCY") == nil;
+#endif
+
         ctx->use_fusion = getenv("GGML_METAL_FUSION_DISABLE") == nil;
 
         {
@@ -128,6 +215,7 @@ static id<MTLDevice> ggml_backend_metal_device_acq(struct ggml_backend_metal_dev
 
     return ctx->mtl_device;
 }
+
 
 // release
 static void ggml_backend_metal_device_rel(struct ggml_backend_metal_device_context * ctx) {
@@ -158,6 +246,12 @@ static void ggml_backend_metal_device_rel(struct ggml_backend_metal_device_conte
             [ctx->mtl_library release];
             ctx->mtl_library = nil;
         }
+
+        if (ctx->mtl_queue_copy) {
+            [ctx->mtl_queue_copy release];
+            ctx->mtl_queue_copy = nil;
+        }
+
 
         if (ctx->mtl_device) {
             [ctx->mtl_device release];
@@ -821,7 +915,29 @@ static id<MTLBuffer> ggml_metal_mem_pool_alloc(struct ggml_metal_mem_pool * mem_
     // create a new heap that can fit this buffer
     ggml_metal_heap_ptr * heap_ptr = [ggml_metal_heap_ptr new];
 
-    struct ggml_metal_heap * heap = ggml_metal_heap_init(mem_pool->device, size_aligned);
+    // Create a new heap that can fit this buffer.
+// For discrete GPUs (e.g. Radeon Pro W6800X), allocating heaps that are too small tends to create many heaps and extra CPU overhead.
+// The minimum size can be overridden via GGML_METAL_HEAP_MIN_MB.
+size_t heap_size = size_aligned;
+const char * env_min_mb = getenv("GGML_METAL_HEAP_MIN_MB");
+if (env_min_mb) {
+    const long mb = strtol(env_min_mb, NULL, 10);
+    if (mb > 0) {
+        heap_size = MAX(heap_size, (size_t) mb * 1024 * 1024);
+    }
+} else {
+#if TARGET_OS_OSX
+    const bool is_discrete = !mem_pool->device.hasUnifiedMemory;
+    heap_size = MAX(heap_size, is_discrete ? (size_t) (32 * 1024 * 1024) : (size_t) (8 * 1024 * 1024));
+#else
+    heap_size = MAX(heap_size, (size_t) (8 * 1024 * 1024));
+#endif
+}
+// round heap size to 2 MiB to reduce fragmentation
+const size_t heap_align = (size_t) (2 * 1024 * 1024);
+heap_size = (heap_size + heap_align - 1) / heap_align * heap_align;
+
+struct ggml_metal_heap * heap = ggml_metal_heap_init(mem_pool->device, heap_size);
     if (heap == NULL) {
         GGML_LOG_ERROR("%s: error: failed to create heap of size %zu\n", __func__, size_aligned);
         return NULL;
@@ -1185,7 +1301,13 @@ static struct ggml_backend_metal_context * ggml_metal_init(ggml_backend_dev_t de
         const bool has_simdgroup_mm        = ctx_dev->has_simdgroup_mm;
         const bool has_simdgroup_reduction = ctx_dev->has_simdgroup_reduction;
         const bool use_bfloat              = ctx_dev->use_bfloat;
-
+        
+        // AMD discrete target (no unified memory):
+        // - enable mul_mm / mul_mm_id kernels for performance even if ctx_dev->has_simdgroup_mm is false
+        // - keep flash_attn_ext disabled to avoid AMD shader compiler failures ("undefined label")
+        const bool has_unified_memory  = device.hasUnifiedMemory;
+        const bool allow_mm_kernels    = has_simdgroup_mm || !has_unified_memory;
+        const bool allow_flash_attn_ext = has_unified_memory && has_simdgroup_mm;
         // simd_sum and simd_max requires MTLGPUFamilyApple7
 
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_ADD,                             add,                             true);
@@ -1388,55 +1510,57 @@ static struct ggml_backend_metal_context * ggml_metal_init(ggml_backend_dev_t de
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MV_ID_IQ1_M_F32,             mul_mv_id_iq1_m_f32,             has_simdgroup_reduction);
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MV_ID_IQ4_NL_F32,            mul_mv_id_iq4_nl_f32,            has_simdgroup_reduction);
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MV_ID_IQ4_XS_F32,            mul_mv_id_iq4_xs_f32,            has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_F32_F32,                  mul_mm_f32_f32,                  has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_F16_F32,                  mul_mm_f16_f32,                  has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_BF16_F32,                 mul_mm_bf16_f32,                 has_simdgroup_mm && use_bfloat);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_Q4_0_F32,                 mul_mm_q4_0_f32,                 has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_Q4_1_F32,                 mul_mm_q4_1_f32,                 has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_Q5_0_F32,                 mul_mm_q5_0_f32,                 has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_Q5_1_F32,                 mul_mm_q5_1_f32,                 has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_Q8_0_F32,                 mul_mm_q8_0_f32,                 has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_MXFP4_F32,                mul_mm_mxfp4_f32,                has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_MXFP4_F32,                mul_mm_mxfp4_f32,                has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_Q2_K_F32,                 mul_mm_q2_K_f32,                 has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_Q3_K_F32,                 mul_mm_q3_K_f32,                 has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_Q4_K_F32,                 mul_mm_q4_K_f32,                 has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_Q5_K_F32,                 mul_mm_q5_K_f32,                 has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_Q6_K_F32,                 mul_mm_q6_K_f32,                 has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_IQ2_XXS_F32,              mul_mm_iq2_xxs_f32,              has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_IQ2_XS_F32,               mul_mm_iq2_xs_f32,               has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_IQ3_XXS_F32,              mul_mm_iq3_xxs_f32,              has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_IQ3_S_F32,                mul_mm_iq3_s_f32,                has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_IQ2_S_F32,                mul_mm_iq2_s_f32,                has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_IQ1_S_F32,                mul_mm_iq1_s_f32,                has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_IQ1_M_F32,                mul_mm_iq1_m_f32,                has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_IQ4_NL_F32,               mul_mm_iq4_nl_f32,               has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_IQ4_XS_F32,               mul_mm_iq4_xs_f32,               has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_MAP0_F16,              mul_mm_id_map0_f16,              has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_MAP1_F32,              mul_mm_id_map1_f32,              has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_F32_F16,               mul_mm_id_f32_f16,               has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_F16_F16,               mul_mm_id_f16_f16,               has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_BF16_F16,              mul_mm_id_bf16_f16,              has_simdgroup_mm && use_bfloat);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_Q4_0_F16,              mul_mm_id_q4_0_f16,              has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_Q4_1_F16,              mul_mm_id_q4_1_f16,              has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_Q5_0_F16,              mul_mm_id_q5_0_f16,              has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_Q5_1_F16,              mul_mm_id_q5_1_f16,              has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_Q8_0_F16,              mul_mm_id_q8_0_f16,              has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_MXFP4_F16,             mul_mm_id_mxfp4_f16,             has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_Q2_K_F16,              mul_mm_id_q2_K_f16,              has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_Q3_K_F16,              mul_mm_id_q3_K_f16,              has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_Q4_K_F16,              mul_mm_id_q4_K_f16,              has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_Q5_K_F16,              mul_mm_id_q5_K_f16,              has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_Q6_K_F16,              mul_mm_id_q6_K_f16,              has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_IQ2_XXS_F16,           mul_mm_id_iq2_xxs_f16,           has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_IQ2_XS_F16,            mul_mm_id_iq2_xs_f16,            has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_IQ3_XXS_F16,           mul_mm_id_iq3_xxs_f16,           has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_IQ3_S_F16,             mul_mm_id_iq3_s_f16,             has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_IQ2_S_F16,             mul_mm_id_iq2_s_f16,             has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_IQ1_S_F16,             mul_mm_id_iq1_s_f16,             has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_IQ1_M_F16,             mul_mm_id_iq1_m_f16,             has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_IQ4_NL_F16,            mul_mm_id_iq4_nl_f16,            has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_IQ4_XS_F16,            mul_mm_id_iq4_xs_f16,            has_simdgroup_mm);
+        
+        
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_F32_F32,                  mul_mm_f32_f32,                  allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_F16_F32,                  mul_mm_f16_f32,                  allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_BF16_F32,                 mul_mm_bf16_f32,                 allow_mm_kernels && use_bfloat);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_Q4_0_F32,                 mul_mm_q4_0_f32,                 allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_Q4_1_F32,                 mul_mm_q4_1_f32,                 allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_Q5_0_F32,                 mul_mm_q5_0_f32,                 allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_Q5_1_F32,                 mul_mm_q5_1_f32,                 allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_Q8_0_F32,                 mul_mm_q8_0_f32,                 allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_MXFP4_F32,                mul_mm_mxfp4_f32,                allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_MXFP4_F32,                mul_mm_mxfp4_f32,                allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_Q2_K_F32,                 mul_mm_q2_K_f32,                 allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_Q3_K_F32,                 mul_mm_q3_K_f32,                 allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_Q4_K_F32,                 mul_mm_q4_K_f32,                 allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_Q5_K_F32,                 mul_mm_q5_K_f32,                 allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_Q6_K_F32,                 mul_mm_q6_K_f32,                 allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_IQ2_XXS_F32,              mul_mm_iq2_xxs_f32,              allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_IQ2_XS_F32,               mul_mm_iq2_xs_f32,               allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_IQ3_XXS_F32,              mul_mm_iq3_xxs_f32,              allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_IQ3_S_F32,                mul_mm_iq3_s_f32,                allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_IQ2_S_F32,                mul_mm_iq2_s_f32,                allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_IQ1_S_F32,                mul_mm_iq1_s_f32,                allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_IQ1_M_F32,                mul_mm_iq1_m_f32,                allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_IQ4_NL_F32,               mul_mm_iq4_nl_f32,               allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_IQ4_XS_F32,               mul_mm_iq4_xs_f32,               allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_MAP0_F16,              mul_mm_id_map0_f16,              allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_MAP1_F32,              mul_mm_id_map1_f32,              allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_F32_F16,               mul_mm_id_f32_f16,               allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_F16_F16,               mul_mm_id_f16_f16,               allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_BF16_F16,              mul_mm_id_bf16_f16,              allow_mm_kernels && use_bfloat);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_Q4_0_F16,              mul_mm_id_q4_0_f16,              allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_Q4_1_F16,              mul_mm_id_q4_1_f16,              allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_Q5_0_F16,              mul_mm_id_q5_0_f16,              allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_Q5_1_F16,              mul_mm_id_q5_1_f16,              allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_Q8_0_F16,              mul_mm_id_q8_0_f16,              allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_MXFP4_F16,             mul_mm_id_mxfp4_f16,             allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_Q2_K_F16,              mul_mm_id_q2_K_f16,              allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_Q3_K_F16,              mul_mm_id_q3_K_f16,              allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_Q4_K_F16,              mul_mm_id_q4_K_f16,              allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_Q5_K_F16,              mul_mm_id_q5_K_f16,              allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_Q6_K_F16,              mul_mm_id_q6_K_f16,              allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_IQ2_XXS_F16,           mul_mm_id_iq2_xxs_f16,           allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_IQ2_XS_F16,            mul_mm_id_iq2_xs_f16,            allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_IQ3_XXS_F16,           mul_mm_id_iq3_xxs_f16,           allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_IQ3_S_F16,             mul_mm_id_iq3_s_f16,             allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_IQ2_S_F16,             mul_mm_id_iq2_s_f16,             allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_IQ1_S_F16,             mul_mm_id_iq1_s_f16,             allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_IQ1_M_F16,             mul_mm_id_iq1_m_f16,             allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_IQ4_NL_F16,            mul_mm_id_iq4_nl_f16,            allow_mm_kernels);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_IQ4_XS_F16,            mul_mm_id_iq4_xs_f16,            allow_mm_kernels);
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_ROPE_NORM_F32,                   rope_norm_f32,                   true);
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_ROPE_NORM_F16,                   rope_norm_f16,                   true);
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_ROPE_MULTI_F32,                  rope_multi_f32,                  true);
@@ -1459,118 +1583,120 @@ static struct ggml_backend_metal_context * ggml_metal_init(ggml_backend_dev_t de
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_ARGSORT_F32_I32_ASC,             argsort_f32_i32_asc,             true);
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_ARGSORT_F32_I32_DESC,            argsort_f32_i32_desc,            true);
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_LEAKY_RELU_F32,                  leaky_relu_f32,                  true);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_F16_H64,          flash_attn_ext_f16_h64,          has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_F16_H80,          flash_attn_ext_f16_h80,          has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_F16_H96,          flash_attn_ext_f16_h96,          has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_F16_H112,         flash_attn_ext_f16_h112,         has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_F16_H128,         flash_attn_ext_f16_h128,         has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_F16_H192,         flash_attn_ext_f16_h192,         has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_F16_HK192_HV128,  flash_attn_ext_f16_hk192_hv128,  has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_F16_H256,         flash_attn_ext_f16_h256,         has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_F16_HK576_HV512,  flash_attn_ext_f16_hk576_hv512,  has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_BF16_H64,         flash_attn_ext_bf16_h64,         has_simdgroup_mm && use_bfloat);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_BF16_H80,         flash_attn_ext_bf16_h80,         has_simdgroup_mm && use_bfloat);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_BF16_H96,         flash_attn_ext_bf16_h96,         has_simdgroup_mm && use_bfloat);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_BF16_H112,        flash_attn_ext_bf16_h112,        has_simdgroup_mm && use_bfloat);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_BF16_H128,        flash_attn_ext_bf16_h128,        has_simdgroup_mm && use_bfloat);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_BF16_H192,        flash_attn_ext_bf16_h192,        has_simdgroup_mm && use_bfloat);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_BF16_HK192_HV128, flash_attn_ext_bf16_hk192_hv128, has_simdgroup_mm && use_bfloat);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_BF16_H256,        flash_attn_ext_bf16_h256,        has_simdgroup_mm && use_bfloat);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_BF16_HK576_HV512, flash_attn_ext_bf16_hk576_hv512, has_simdgroup_mm && use_bfloat);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q4_0_H64,         flash_attn_ext_q4_0_h64,         has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q4_0_H80,         flash_attn_ext_q4_0_h80,         has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q4_0_H96,         flash_attn_ext_q4_0_h96,         has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q4_0_H112,        flash_attn_ext_q4_0_h112,        has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q4_0_H128,        flash_attn_ext_q4_0_h128,        has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q4_0_H192,        flash_attn_ext_q4_0_h192,        has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q4_0_HK192_HV128, flash_attn_ext_q4_0_hk192_hv128, has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q4_0_H256,        flash_attn_ext_q4_0_h256,        has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q4_0_HK576_HV512, flash_attn_ext_q4_0_hk576_hv512, has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q4_1_H64,         flash_attn_ext_q4_1_h64,         has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q4_1_H80,         flash_attn_ext_q4_1_h80,         has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q4_1_H96,         flash_attn_ext_q4_1_h96,         has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q4_1_H112,        flash_attn_ext_q4_1_h112,        has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q4_1_H128,        flash_attn_ext_q4_1_h128,        has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q4_1_H192,        flash_attn_ext_q4_1_h192,        has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q4_1_HK192_HV128, flash_attn_ext_q4_1_hk192_hv128, has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q4_1_H256,        flash_attn_ext_q4_1_h256,        has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q4_1_HK576_HV512, flash_attn_ext_q4_1_hk576_hv512, has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q5_0_H64,         flash_attn_ext_q5_0_h64,         has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q5_0_H80,         flash_attn_ext_q5_0_h80,         has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q5_0_H96,         flash_attn_ext_q5_0_h96,         has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q5_0_H112,        flash_attn_ext_q5_0_h112,        has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q5_0_H128,        flash_attn_ext_q5_0_h128,        has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q5_0_H192,        flash_attn_ext_q5_0_h192,        has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q5_0_HK192_HV128, flash_attn_ext_q5_0_hk192_hv128, has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q5_0_H256,        flash_attn_ext_q5_0_h256,        has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q5_0_HK576_HV512, flash_attn_ext_q5_0_hk576_hv512, has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q5_1_H64,         flash_attn_ext_q5_1_h64,         has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q5_1_H80,         flash_attn_ext_q5_1_h80,         has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q5_1_H96,         flash_attn_ext_q5_1_h96,         has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q5_1_H112,        flash_attn_ext_q5_1_h112,        has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q5_1_H128,        flash_attn_ext_q5_1_h128,        has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q5_1_H192,        flash_attn_ext_q5_1_h192,        has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q5_1_HK192_HV128, flash_attn_ext_q5_1_hk192_hv128, has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q5_1_H256,        flash_attn_ext_q5_1_h256,        has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q5_1_HK576_HV512, flash_attn_ext_q5_1_hk576_hv512, has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q8_0_H64,         flash_attn_ext_q8_0_h64,         has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q8_0_H80,         flash_attn_ext_q8_0_h80,         has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q8_0_H96,         flash_attn_ext_q8_0_h96,         has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q8_0_H112,        flash_attn_ext_q8_0_h112,        has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q8_0_H128,        flash_attn_ext_q8_0_h128,        has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q8_0_H192,        flash_attn_ext_q8_0_h192,        has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q8_0_HK192_HV128, flash_attn_ext_q8_0_hk192_hv128, has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q8_0_H256,        flash_attn_ext_q8_0_h256,        has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q8_0_HK576_HV512, flash_attn_ext_q8_0_hk576_hv512, has_simdgroup_mm);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_F16_H64,      flash_attn_ext_vec_f16_h64,      has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_BF16_H64,     flash_attn_ext_vec_bf16_h64,     has_simdgroup_reduction && use_bfloat);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q4_0_H64,     flash_attn_ext_vec_q4_0_h64,     has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q4_1_H64,     flash_attn_ext_vec_q4_1_h64,     has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q5_0_H64,     flash_attn_ext_vec_q5_0_h64,     has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q5_1_H64,     flash_attn_ext_vec_q5_1_h64,     has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q8_0_H64,     flash_attn_ext_vec_q8_0_h64,     has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_F16_H96,      flash_attn_ext_vec_f16_h96,      has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_BF16_H96,     flash_attn_ext_vec_bf16_h96,     has_simdgroup_reduction && use_bfloat);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q4_0_H96,     flash_attn_ext_vec_q4_0_h96,     has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q4_1_H96,     flash_attn_ext_vec_q4_1_h96,     has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q5_0_H96,     flash_attn_ext_vec_q5_0_h96,     has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q5_1_H96,     flash_attn_ext_vec_q5_1_h96,     has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q8_0_H96,     flash_attn_ext_vec_q8_0_h96,     has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_F16_H128,     flash_attn_ext_vec_f16_h128,     has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_BF16_H128,    flash_attn_ext_vec_bf16_h128,    has_simdgroup_reduction && use_bfloat);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q4_0_H128,    flash_attn_ext_vec_q4_0_h128,    has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q4_1_H128,    flash_attn_ext_vec_q4_1_h128,    has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q5_0_H128,    flash_attn_ext_vec_q5_0_h128,    has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q5_1_H128,    flash_attn_ext_vec_q5_1_h128,    has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q8_0_H128,    flash_attn_ext_vec_q8_0_h128,    has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_F16_H192,     flash_attn_ext_vec_f16_h192,     has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_BF16_H192,    flash_attn_ext_vec_bf16_h192,    has_simdgroup_reduction && use_bfloat);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q4_0_H192,    flash_attn_ext_vec_q4_0_h192,    has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q4_1_H192,    flash_attn_ext_vec_q4_1_h192,    has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q5_0_H192,    flash_attn_ext_vec_q5_0_h192,    has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q5_1_H192,    flash_attn_ext_vec_q5_1_h192,    has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q8_0_H192,    flash_attn_ext_vec_q8_0_h192,    has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_F16_HK192_HV128,     flash_attn_ext_vec_f16_hk192_hv128,     has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_BF16_HK192_HV128,    flash_attn_ext_vec_bf16_hk192_hv128,    has_simdgroup_reduction && use_bfloat);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q4_0_HK192_HV128,    flash_attn_ext_vec_q4_0_hk192_hv128,    has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q4_1_HK192_HV128,    flash_attn_ext_vec_q4_1_hk192_hv128,    has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q5_0_HK192_HV128,    flash_attn_ext_vec_q5_0_hk192_hv128,    has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q5_1_HK192_HV128,    flash_attn_ext_vec_q5_1_hk192_hv128,    has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q8_0_HK192_HV128,    flash_attn_ext_vec_q8_0_hk192_hv128,    has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_F16_H256,     flash_attn_ext_vec_f16_h256,     has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_BF16_H256,    flash_attn_ext_vec_bf16_h256,    has_simdgroup_reduction && use_bfloat);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q4_0_H256,    flash_attn_ext_vec_q4_0_h256,    has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q4_1_H256,    flash_attn_ext_vec_q4_1_h256,    has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q5_0_H256,    flash_attn_ext_vec_q5_0_h256,    has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q5_1_H256,    flash_attn_ext_vec_q5_1_h256,    has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q8_0_H256,    flash_attn_ext_vec_q8_0_h256,    has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_F16_HK576_HV512,     flash_attn_ext_vec_f16_hk576_hv512,     has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_BF16_HK576_HV512,    flash_attn_ext_vec_bf16_hk576_hv512,    has_simdgroup_reduction && use_bfloat);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q4_0_HK576_HV512,    flash_attn_ext_vec_q4_0_hk576_hv512,    has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q4_1_HK576_HV512,    flash_attn_ext_vec_q4_1_hk576_hv512,    has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q5_0_HK576_HV512,    flash_attn_ext_vec_q5_0_hk576_hv512,    has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q5_1_HK576_HV512,    flash_attn_ext_vec_q5_1_hk576_hv512,    has_simdgroup_reduction);
-        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q8_0_HK576_HV512,    flash_attn_ext_vec_q8_0_hk576_hv512,    has_simdgroup_reduction);
+        const bool allow_flash_attn_vec = device.hasUnifiedMemory && has_simdgroup_reduction;
+        
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_F16_H64,          flash_attn_ext_f16_h64,          allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_F16_H80,          flash_attn_ext_f16_h80,          allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_F16_H96,          flash_attn_ext_f16_h96,          allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_F16_H112,         flash_attn_ext_f16_h112,         allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_F16_H128,         flash_attn_ext_f16_h128,         allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_F16_H192,         flash_attn_ext_f16_h192,         allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_F16_HK192_HV128,  flash_attn_ext_f16_hk192_hv128,  allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_F16_H256,         flash_attn_ext_f16_h256,         allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_F16_HK576_HV512,  flash_attn_ext_f16_hk576_hv512,  allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_BF16_H64,         flash_attn_ext_bf16_h64,         allow_flash_attn_ext && use_bfloat);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_BF16_H80,         flash_attn_ext_bf16_h80,         allow_flash_attn_ext && use_bfloat);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_BF16_H96,         flash_attn_ext_bf16_h96,         allow_flash_attn_ext && use_bfloat);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_BF16_H112,        flash_attn_ext_bf16_h112,        allow_flash_attn_ext && use_bfloat);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_BF16_H128,        flash_attn_ext_bf16_h128,        allow_flash_attn_ext && use_bfloat);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_BF16_H192,        flash_attn_ext_bf16_h192,        allow_flash_attn_ext && use_bfloat);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_BF16_HK192_HV128, flash_attn_ext_bf16_hk192_hv128, allow_flash_attn_ext && use_bfloat);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_BF16_H256,        flash_attn_ext_bf16_h256,        allow_flash_attn_ext && use_bfloat);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_BF16_HK576_HV512, flash_attn_ext_bf16_hk576_hv512, allow_flash_attn_ext && use_bfloat);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q4_0_H64,         flash_attn_ext_q4_0_h64,         allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q4_0_H80,         flash_attn_ext_q4_0_h80,         allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q4_0_H96,         flash_attn_ext_q4_0_h96,         allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q4_0_H112,        flash_attn_ext_q4_0_h112,        allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q4_0_H128,        flash_attn_ext_q4_0_h128,        allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q4_0_H192,        flash_attn_ext_q4_0_h192,        allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q4_0_HK192_HV128, flash_attn_ext_q4_0_hk192_hv128, allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q4_0_H256,        flash_attn_ext_q4_0_h256,        allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q4_0_HK576_HV512, flash_attn_ext_q4_0_hk576_hv512, allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q4_1_H64,         flash_attn_ext_q4_1_h64,         allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q4_1_H80,         flash_attn_ext_q4_1_h80,         allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q4_1_H96,         flash_attn_ext_q4_1_h96,         allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q4_1_H112,        flash_attn_ext_q4_1_h112,        allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q4_1_H128,        flash_attn_ext_q4_1_h128,        allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q4_1_H192,        flash_attn_ext_q4_1_h192,        allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q4_1_HK192_HV128, flash_attn_ext_q4_1_hk192_hv128, allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q4_1_H256,        flash_attn_ext_q4_1_h256,        allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q4_1_HK576_HV512, flash_attn_ext_q4_1_hk576_hv512, allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q5_0_H64,         flash_attn_ext_q5_0_h64,         allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q5_0_H80,         flash_attn_ext_q5_0_h80,         allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q5_0_H96,         flash_attn_ext_q5_0_h96,         allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q5_0_H112,        flash_attn_ext_q5_0_h112,        allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q5_0_H128,        flash_attn_ext_q5_0_h128,        allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q5_0_H192,        flash_attn_ext_q5_0_h192,        allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q5_0_HK192_HV128, flash_attn_ext_q5_0_hk192_hv128, allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q5_0_H256,        flash_attn_ext_q5_0_h256,        allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q5_0_HK576_HV512, flash_attn_ext_q5_0_hk576_hv512, allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q5_1_H64,         flash_attn_ext_q5_1_h64,         allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q5_1_H80,         flash_attn_ext_q5_1_h80,         allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q5_1_H96,         flash_attn_ext_q5_1_h96,         allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q5_1_H112,        flash_attn_ext_q5_1_h112,        allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q5_1_H128,        flash_attn_ext_q5_1_h128,        allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q5_1_H192,        flash_attn_ext_q5_1_h192,        allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q5_1_HK192_HV128, flash_attn_ext_q5_1_hk192_hv128, allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q5_1_H256,        flash_attn_ext_q5_1_h256,        allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q5_1_HK576_HV512, flash_attn_ext_q5_1_hk576_hv512, allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q8_0_H64,         flash_attn_ext_q8_0_h64,         allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q8_0_H80,         flash_attn_ext_q8_0_h80,         allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q8_0_H96,         flash_attn_ext_q8_0_h96,         allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q8_0_H112,        flash_attn_ext_q8_0_h112,        allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q8_0_H128,        flash_attn_ext_q8_0_h128,        allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q8_0_H192,        flash_attn_ext_q8_0_h192,        allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q8_0_HK192_HV128, flash_attn_ext_q8_0_hk192_hv128, allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q8_0_H256,        flash_attn_ext_q8_0_h256,        allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_Q8_0_HK576_HV512, flash_attn_ext_q8_0_hk576_hv512, allow_flash_attn_ext);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_F16_H64,      flash_attn_ext_vec_f16_h64,      allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_BF16_H64,     flash_attn_ext_vec_bf16_h64,     allow_flash_attn_vec && use_bfloat);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q4_0_H64,     flash_attn_ext_vec_q4_0_h64,     allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q4_1_H64,     flash_attn_ext_vec_q4_1_h64,     allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q5_0_H64,     flash_attn_ext_vec_q5_0_h64,     allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q5_1_H64,     flash_attn_ext_vec_q5_1_h64,     allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q8_0_H64,     flash_attn_ext_vec_q8_0_h64,     allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_F16_H96,      flash_attn_ext_vec_f16_h96,      allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_BF16_H96,     flash_attn_ext_vec_bf16_h96,     allow_flash_attn_vec && use_bfloat);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q4_0_H96,     flash_attn_ext_vec_q4_0_h96,     allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q4_1_H96,     flash_attn_ext_vec_q4_1_h96,     allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q5_0_H96,     flash_attn_ext_vec_q5_0_h96,     allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q5_1_H96,     flash_attn_ext_vec_q5_1_h96,     allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q8_0_H96,     flash_attn_ext_vec_q8_0_h96,     allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_F16_H128,     flash_attn_ext_vec_f16_h128,     allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_BF16_H128,    flash_attn_ext_vec_bf16_h128,    allow_flash_attn_vec && use_bfloat);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q4_0_H128,    flash_attn_ext_vec_q4_0_h128,    allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q4_1_H128,    flash_attn_ext_vec_q4_1_h128,    allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q5_0_H128,    flash_attn_ext_vec_q5_0_h128,    allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q5_1_H128,    flash_attn_ext_vec_q5_1_h128,    allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q8_0_H128,    flash_attn_ext_vec_q8_0_h128,    allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_F16_H192,     flash_attn_ext_vec_f16_h192,     allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_BF16_H192,    flash_attn_ext_vec_bf16_h192,    allow_flash_attn_vec && use_bfloat);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q4_0_H192,    flash_attn_ext_vec_q4_0_h192,    allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q4_1_H192,    flash_attn_ext_vec_q4_1_h192,    allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q5_0_H192,    flash_attn_ext_vec_q5_0_h192,    allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q5_1_H192,    flash_attn_ext_vec_q5_1_h192,    allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q8_0_H192,    flash_attn_ext_vec_q8_0_h192,    allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_F16_HK192_HV128,     flash_attn_ext_vec_f16_hk192_hv128,     allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_BF16_HK192_HV128,    flash_attn_ext_vec_bf16_hk192_hv128,    allow_flash_attn_vec && use_bfloat);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q4_0_HK192_HV128,    flash_attn_ext_vec_q4_0_hk192_hv128,    allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q4_1_HK192_HV128,    flash_attn_ext_vec_q4_1_hk192_hv128,    allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q5_0_HK192_HV128,    flash_attn_ext_vec_q5_0_hk192_hv128,    allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q5_1_HK192_HV128,    flash_attn_ext_vec_q5_1_hk192_hv128,    allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q8_0_HK192_HV128,    flash_attn_ext_vec_q8_0_hk192_hv128,    allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_F16_H256,     flash_attn_ext_vec_f16_h256,     allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_BF16_H256,    flash_attn_ext_vec_bf16_h256,    allow_flash_attn_vec && use_bfloat);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q4_0_H256,    flash_attn_ext_vec_q4_0_h256,    allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q4_1_H256,    flash_attn_ext_vec_q4_1_h256,    allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q5_0_H256,    flash_attn_ext_vec_q5_0_h256,    allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q5_1_H256,    flash_attn_ext_vec_q5_1_h256,    allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q8_0_H256,    flash_attn_ext_vec_q8_0_h256,    allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_F16_HK576_HV512,     flash_attn_ext_vec_f16_hk576_hv512,     allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_BF16_HK576_HV512,    flash_attn_ext_vec_bf16_hk576_hv512,    allow_flash_attn_vec && use_bfloat);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q4_0_HK576_HV512,    flash_attn_ext_vec_q4_0_hk576_hv512,    allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q4_1_HK576_HV512,    flash_attn_ext_vec_q4_1_hk576_hv512,    allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q5_0_HK576_HV512,    flash_attn_ext_vec_q5_0_hk576_hv512,    allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q5_1_HK576_HV512,    flash_attn_ext_vec_q5_1_hk576_hv512,    allow_flash_attn_vec);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_FLASH_ATTN_EXT_VEC_Q8_0_HK576_HV512,    flash_attn_ext_vec_q8_0_hk576_hv512,    allow_flash_attn_vec);
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_SET_F32,                         set_f32,                         true);
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_SET_I32,                         set_i32,                         true);
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_CPY_F32_F32,                     cpy_f32_f32,                     true);
@@ -1725,7 +1851,7 @@ static void ggml_backend_metal_buffer_rset_free(struct ggml_backend_metal_buffer
 // the assumption is that there is 1-to-1 mapping between the host and device memory buffers, so we can find the
 // Metal buffer based on the host memory pointer
 //
-static id<MTLBuffer> ggml_metal_get_buffer(struct ggml_tensor * t, size_t * offs) {
+static id<MTLBuffer> ggml_metal_get_buffer(const struct ggml_tensor * t, size_t * offs) {
     //GGML_LOG_INFO("%s: data tensor '%16s', offs_data = %8ld, offs_eval = %8ld, offs_cach = %8ld\n", __func__, t->name, offs_data, offs_eval, offs_cach);
 
     const int64_t tsize = ggml_nbytes(t);
@@ -6042,36 +6168,213 @@ static void * ggml_backend_metal_buffer_get_base(ggml_backend_buffer_t buffer) {
 
 static void ggml_backend_metal_buffer_memset_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     memset((char *)tensor->data + offset, value, size);
-
-    GGML_UNUSED(buffer);
+    
+    // If the backing MTLBuffer is private, mirror the memset on the GPU.
+    @autoreleasepool {
+        struct ggml_backend_metal_device_context * ctx_dev = (struct ggml_backend_metal_device_context *) buffer->buft->device->context;
+        if (ctx_dev == NULL || ctx_dev->mtl_device == nil) {
+            return;
+        }
+        
+        size_t offs = 0;
+        id<MTLBuffer> mtl_buf = ggml_metal_get_buffer(tensor, &offs);
+        if (mtl_buf == nil || mtl_buf.storageMode != MTLStorageModePrivate) {
+            return;
+        }
+        
+        const size_t abs_offs = offs + offset;
+        if (abs_offs + size > (size_t) mtl_buf.length) {
+            GGML_LOG_ERROR("%s: error: out-of-bounds memset (abs_offs=%zu size=%zu len=%zu)\n", __func__, abs_offs, size, (size_t) mtl_buf.length);
+            return;
+        }
+        
+        id<MTLCommandQueue> q = ctx_dev->mtl_queue_copy;
+        if (q == nil) {
+            q = [ctx_dev->mtl_device newCommandQueue];
+        }
+        
+        if (ctx_dev->mtl_lock) { [ctx_dev->mtl_lock lock]; }
+        id<MTLCommandBuffer> cb = [q respondsToSelector:@selector(commandBufferWithUnretainedReferences)] ? [q commandBufferWithUnretainedReferences] : [q commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        [blit fillBuffer:mtl_buf range:NSMakeRange((NSUInteger) abs_offs, (NSUInteger) size) value:value];
+        [blit endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (ctx_dev->mtl_lock) { [ctx_dev->mtl_lock unlock]; }
+        
+        if (q != ctx_dev->mtl_queue_copy) {
+            [q release];
+        }
+    }
 }
 
 static void ggml_backend_metal_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     memcpy((char *)tensor->data + offset, data, size);
-
-    GGML_UNUSED(buffer);
+    
+    @autoreleasepool {
+        struct ggml_backend_metal_device_context * ctx_dev = (struct ggml_backend_metal_device_context *) buffer->buft->device->context;
+        if (ctx_dev == NULL || ctx_dev->mtl_device == nil) {
+            return;
+        }
+        
+        size_t offs = 0;
+        id<MTLBuffer> mtl_buf = ggml_metal_get_buffer(tensor, &offs);
+        if (mtl_buf == nil || mtl_buf.storageMode != MTLStorageModePrivate) {
+            return;
+        }
+        
+        const size_t abs_offs = offs + offset;
+        if (abs_offs + size > (size_t) mtl_buf.length) {
+            GGML_LOG_ERROR("%s: error: out-of-bounds upload (abs_offs=%zu size=%zu len=%zu)\n", __func__, abs_offs, size, (size_t) mtl_buf.length);
+            return;
+        }
+        
+        void * base = (void *) ((uint8_t *) tensor->data - offs);
+        id<MTLBuffer> src = [ctx_dev->mtl_device newBufferWithBytesNoCopy:base length:mtl_buf.length options:MTLResourceStorageModeShared deallocator:nil];
+        if (src == nil) {
+            GGML_LOG_ERROR("%s: error: failed to create staging buffer\n", __func__);
+            return;
+        }
+        
+        id<MTLCommandQueue> q = ctx_dev->mtl_queue_copy;
+        if (q == nil) {
+            q = [ctx_dev->mtl_device newCommandQueue];
+        }
+        
+        if (ctx_dev->mtl_lock) { [ctx_dev->mtl_lock lock]; }
+        id<MTLCommandBuffer> cb = [q respondsToSelector:@selector(commandBufferWithUnretainedReferences)] ? [q commandBufferWithUnretainedReferences] : [q commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        [blit copyFromBuffer:src sourceOffset:(NSUInteger) abs_offs toBuffer:mtl_buf destinationOffset:(NSUInteger) abs_offs size:(NSUInteger) size];
+        [blit endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (ctx_dev->mtl_lock) { [ctx_dev->mtl_lock unlock]; }
+        
+        [src release];
+        if (q != ctx_dev->mtl_queue_copy) {
+            [q release];
+        }
+    }
 }
-
 static void ggml_backend_metal_buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
-    memcpy(data, (const char *)tensor->data + offset, size);
+    @autoreleasepool {
+        struct ggml_backend_metal_device_context * ctx_dev = (struct ggml_backend_metal_device_context *) buffer->buft->device->context;
+        if (ctx_dev != NULL && ctx_dev->mtl_device != nil) {
+            size_t offs = 0;
+            id<MTLBuffer> mtl_buf = ggml_metal_get_buffer(tensor, &offs);
+            if (mtl_buf != nil && mtl_buf.storageMode == MTLStorageModePrivate) {
+                const size_t abs_offs = offs + offset;
+                if (abs_offs + size > (size_t) mtl_buf.length) {
+                    GGML_LOG_ERROR("%s: error: out-of-bounds download (abs_offs=%zu size=%zu len=%zu)\n", __func__, abs_offs, size, (size_t) mtl_buf.length);
+                } else {
+                    void * base = (void *) ((uint8_t *) tensor->data - offs);
+                    id<MTLBuffer> dst = [ctx_dev->mtl_device newBufferWithBytesNoCopy:base length:mtl_buf.length options:MTLResourceStorageModeShared deallocator:nil];
+                    if (dst != nil) {
+                        id<MTLCommandQueue> q = ctx_dev->mtl_queue_copy;
+                        if (q == nil) {
+                            q = [ctx_dev->mtl_device newCommandQueue];
+                        }
 
-    GGML_UNUSED(buffer);
+                        if (ctx_dev->mtl_lock) { [ctx_dev->mtl_lock lock]; }
+                        id<MTLCommandBuffer> cb = [q respondsToSelector:@selector(commandBufferWithUnretainedReferences)] ? [q commandBufferWithUnretainedReferences] : [q commandBuffer];
+                        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+                        [blit copyFromBuffer:mtl_buf sourceOffset:(NSUInteger) abs_offs toBuffer:dst destinationOffset:(NSUInteger) abs_offs size:(NSUInteger) size];
+                        [blit endEncoding];
+                        [cb commit];
+                        [cb waitUntilCompleted];
+                        if (ctx_dev->mtl_lock) { [ctx_dev->mtl_lock unlock]; }
+
+                        if (q != ctx_dev->mtl_queue_copy) {
+                            [q release];
+                        }
+                        [dst release];
+                    }
+                }
+            }
+        }
+    }
+
+    memcpy(data, (const char *)tensor->data + offset, size);
 }
+
 
 static bool ggml_backend_metal_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * src, struct ggml_tensor * dst) {
     if (ggml_backend_buffer_is_host(src->buffer)) {
         memcpy(dst->data, src->data, ggml_nbytes(src));
-        return true;
+        // Si dst est backing par un MTLBuffer Private, il faut uploader la copie CPU -> GPU.
+                @autoreleasepool {
+                    struct ggml_backend_metal_device_context * ctx_dev = (struct ggml_backend_metal_device_context *) buffer->buft->device->context;
+                    if (ctx_dev != NULL && ctx_dev->mtl_device != nil) {
+                        size_t offs = 0;
+                        id<MTLBuffer> mtl_buf = ggml_metal_get_buffer(dst, &offs);
+                        if (mtl_buf != nil && mtl_buf.storageMode == MTLStorageModePrivate) {
+                            const size_t size = ggml_nbytes(dst);
+                            if (offs + size <= (size_t) mtl_buf.length) {
+                                void * base = (void *) ((uint8_t *) dst->data - offs);
+                                id<MTLBuffer> src_stage = [ctx_dev->mtl_device newBufferWithBytesNoCopy:base length:mtl_buf.length options:MTLResourceStorageModeShared deallocator:nil];
+                                if (src_stage != nil) {
+                                    id<MTLCommandQueue> q = ctx_dev->mtl_queue_copy;
+                                    if (q == nil) {
+                                        q = [ctx_dev->mtl_device newCommandQueue];
+                                    }
+
+                                    if (ctx_dev->mtl_lock) { [ctx_dev->mtl_lock lock]; }
+                                    id<MTLCommandBuffer> cb = [q respondsToSelector:@selector(commandBufferWithUnretainedReferences)] ? [q commandBufferWithUnretainedReferences] : [q commandBuffer];
+                                    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+                                    [blit copyFromBuffer:src_stage sourceOffset:(NSUInteger) offs toBuffer:mtl_buf destinationOffset:(NSUInteger) offs size:(NSUInteger) size];
+                                    [blit endEncoding];
+                                    [cb commit];
+                                    [cb waitUntilCompleted];
+                                    if (ctx_dev->mtl_lock) { [ctx_dev->mtl_lock unlock]; }
+
+                                    if (q != ctx_dev->mtl_queue_copy) {
+                                        [q release];
+                                    }
+                                    [src_stage release];
+                                }
+                            }
+                        }
+                    }
+                }        return true;
     }
     return false;
 
-    GGML_UNUSED(buffer);
 }
 
 static void ggml_backend_metal_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     struct ggml_backend_metal_buffer_context * ctx = (struct ggml_backend_metal_buffer_context *)buffer->context;
 
     memset(ctx->all_data, value, ctx->all_size);
+    // Mirror le clear côté GPU si buffers Private (important sur Mac Intel + GPU discret).
+    @autoreleasepool {
+        struct ggml_backend_metal_device_context * ctx_dev = (struct ggml_backend_metal_device_context *) buffer->buft->device->context;
+        if (ctx_dev == NULL || ctx_dev->mtl_device == nil) {
+            return;
+        }
+
+        id<MTLCommandQueue> q = ctx_dev->mtl_queue_copy;
+        if (q == nil) {
+            q = [ctx_dev->mtl_device newCommandQueue];
+        }
+
+        if (ctx_dev->mtl_lock) { [ctx_dev->mtl_lock lock]; }
+        id<MTLCommandBuffer> cb = [q respondsToSelector:@selector(commandBufferWithUnretainedReferences)] ? [q commandBufferWithUnretainedReferences] : [q commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        for (int i = 0; i < ctx->n_buffers; ++i) {
+            id<MTLBuffer> b = ctx->buffers[i].metal;
+            if (b != nil && b.storageMode == MTLStorageModePrivate) {
+                [blit fillBuffer:b range:NSMakeRange(0, b.length) value:value];
+            }
+        }
+        [blit endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (ctx_dev->mtl_lock) { [ctx_dev->mtl_lock unlock]; }
+
+        if (q != ctx_dev->mtl_queue_copy) {
+            [q release];
+        }
+    }
 }
 
 static struct ggml_backend_buffer_i ggml_backend_metal_buffer_i = {
@@ -6146,10 +6449,38 @@ static ggml_backend_buffer_t ggml_backend_metal_buffer_type_alloc_buffer(ggml_ba
         ctx->buffers[0].metal = nil;
 
         if (size_aligned > 0) {
-            ctx->buffers[0].metal = [device newBufferWithBytesNoCopy:ctx->all_data
-                                            length:size_aligned
-                                            options:MTLResourceStorageModeShared
-                                            deallocator:nil];
+            {
+                id<MTLBuffer> __src = [device newBufferWithBytesNoCopy:ctx->all_data length:size_aligned options:MTLResourceStorageModeShared deallocator:nil];
+                id<MTLBuffer> __dst = nil;
+                
+#if TARGET_OS_OSX
+                bool __is_discrete = !device.hasUnifiedMemory;
+                // Robust detection for Mac Pro PCIe GPUs: some macOS builds may misreport hasUnifiedMemory.
+#if defined(MTLDeviceLocationSlot)
+                if ([device respondsToSelector:@selector(location)] && device.location == MTLDeviceLocationSlot) { __is_discrete = true; }
+#endif
+                if ([device respondsToSelector:@selector(isRemovable)] && device.removable) { __is_discrete = true; }
+#else
+                bool __is_discrete = false;
+#endif
+                if (__src && __is_discrete) {
+                    __dst = [device newBufferWithLength:size_aligned options:MTLResourceStorageModePrivate];
+                    id<MTLCommandQueue> __q = ctx_dev->mtl_queue_copy;
+                    if (__q == nil) { __q = [device newCommandQueue]; }
+                    id<MTLCommandBuffer> __cb = [__q respondsToSelector:@selector(commandBufferWithUnretainedReferences)] ? [__q commandBufferWithUnretainedReferences] : [__q commandBuffer];
+                    id<MTLBlitCommandEncoder> __blit = [__cb blitCommandEncoder];
+                    [__blit copyFromBuffer:__src sourceOffset:0 toBuffer:__dst destinationOffset:0 size:size_aligned];
+                    [__blit endEncoding];
+                    [__cb commit];
+                    [__cb waitUntilCompleted];
+                    if (ctx_dev->mtl_queue_copy == nil) { [__q release]; }
+                    [__src release];
+                    __src = nil;
+                    ctx->buffers[0].metal = __dst;
+                } else {
+                    ctx->buffers[0].metal = __src;
+                }
+            }
         }
     }
 
@@ -6264,7 +6595,40 @@ ggml_backend_buffer_t ggml_backend_metal_buffer_from_ptr(void * data, size_t siz
         ctx->buffers[ctx->n_buffers].metal = nil;
 
         if (size_aligned > 0) {
-            ctx->buffers[ctx->n_buffers].metal = [device newBufferWithBytesNoCopy:data length:size_aligned options:MTLResourceStorageModeShared deallocator:nil];
+            {
+
+                id<MTLBuffer> __src = [device newBufferWithBytesNoCopy:data length:size_aligned options:MTLResourceStorageModeShared deallocator:nil];
+                id<MTLBuffer> __dst = nil;
+        
+#if TARGET_OS_OSX
+                bool __is_discrete = !device.hasUnifiedMemory;
+                // Robust detection for Mac Pro PCIe GPUs: some macOS builds may misreport hasUnifiedMemory.
+#if defined(MTLDeviceLocationSlot)
+                if ([device respondsToSelector:@selector(location)] && device.location == MTLDeviceLocationSlot) { __is_discrete = true; }
+#endif
+                if ([device respondsToSelector:@selector(isRemovable)] && device.removable) { __is_discrete = true; }
+#else
+                bool __is_discrete = false;
+#endif
+                if (__src && __is_discrete) {
+                    __dst = [device newBufferWithLength:size_aligned options:MTLResourceStorageModePrivate];
+                    id<MTLCommandQueue> __q = ctx_dev->mtl_queue_copy;
+                    if (__q == nil) { __q = [device newCommandQueue]; }
+                    id<MTLCommandBuffer> __cb = [__q respondsToSelector:@selector(commandBufferWithUnretainedReferences)] ? [__q commandBufferWithUnretainedReferences] : [__q commandBuffer];
+                    id<MTLBlitCommandEncoder> __blit = [__cb blitCommandEncoder];
+                    [__blit copyFromBuffer:__src sourceOffset:0 toBuffer:__dst destinationOffset:0 size:size_aligned];
+                    [__blit endEncoding];
+                    [__cb commit];
+                    [__cb waitUntilCompleted];
+                    if (ctx_dev->mtl_queue_copy == nil) { [__q release]; }
+                    [__src release];
+                    __src = nil;
+                    ctx->buffers[ctx->n_buffers].metal = __dst;
+                } else {
+                    ctx->buffers[ctx->n_buffers].metal = __src;
+                }
+            
+}
 
             if (ctx->buffers[ctx->n_buffers].metal == nil) {
                 GGML_LOG_ERROR("%s: error: failed to allocate buffer, size = %8.2f MiB\n", __func__, size_aligned / 1024.0 / 1024.0);
@@ -6290,7 +6654,36 @@ ggml_backend_buffer_t ggml_backend_metal_buffer_from_ptr(void * data, size_t siz
             ctx->buffers[ctx->n_buffers].metal = nil;
 
             if (size_step_aligned > 0) {
-                ctx->buffers[ctx->n_buffers].metal = [device newBufferWithBytesNoCopy:(void *) ((uint8_t *) data + i) length:size_step_aligned options:MTLResourceStorageModeShared deallocator:nil];
+                    {
+        id<MTLBuffer> __src = [device newBufferWithBytesNoCopy:(void *) ((uint8_t *) data + i) length:size_step_aligned options:MTLResourceStorageModeShared deallocator:nil];
+        id<MTLBuffer> __dst = nil;
+#if TARGET_OS_OSX
+                bool __is_discrete = !device.hasUnifiedMemory;
+                // Robust detection for Mac Pro PCIe GPUs: some macOS builds may misreport hasUnifiedMemory.
+#if defined(MTLDeviceLocationSlot)
+                if ([device respondsToSelector:@selector(location)] && device.location == MTLDeviceLocationSlot) { __is_discrete = true; }
+#endif
+                if ([device respondsToSelector:@selector(isRemovable)] && device.removable) { __is_discrete = true; }
+#else
+        bool __is_discrete = false;
+#endif
+        if (__src && __is_discrete) {
+            __dst = [device newBufferWithLength:size_step_aligned options:MTLResourceStorageModePrivate];
+            id<MTLCommandQueue> __q = ctx_dev->mtl_queue_copy;
+                    if (__q == nil) { __q = [device newCommandQueue]; }
+            id<MTLCommandBuffer> __cb = [__q respondsToSelector:@selector(commandBufferWithUnretainedReferences)] ? [__q commandBufferWithUnretainedReferences] : [__q commandBuffer];
+            id<MTLBlitCommandEncoder> __blit = [__cb blitCommandEncoder];
+            [__blit copyFromBuffer:__src sourceOffset:0 toBuffer:__dst destinationOffset:0 size:size_step_aligned];
+            [__blit endEncoding];
+            [__cb commit];
+            [__cb waitUntilCompleted];
+            if (ctx_dev->mtl_queue_copy == nil) { [__q release]; }
+            [__src release];
+            ctx->buffers[ctx->n_buffers].metal = __dst;
+        } else {
+            ctx->buffers[ctx->n_buffers].metal = __src;
+        }
+    }
 
                 if (ctx->buffers[ctx->n_buffers].metal == nil) {
                     GGML_LOG_ERROR("%s: error: failed to allocate buffer, size = %8.2f MiB\n", __func__, size_step_aligned / 1024.0 / 1024.0);
@@ -6407,9 +6800,9 @@ static void ggml_backend_metal_set_n_cb(ggml_backend_t backend, int n_cb) {
         if (cb_idx < 2 || ctx->abort_callback == NULL) {
             [cmd_buf commit];
         }
-    });
+    
+});
 }
-
 static struct ggml_backend_i ggml_backend_metal_i = {
     /* .get_name                = */ ggml_backend_metal_name,
     /* .free                    = */ ggml_backend_metal_free,
@@ -6450,7 +6843,25 @@ ggml_backend_t ggml_backend_metal_init(void) {
         /* .context   = */ ctx,
     };
 
-    ggml_backend_metal_set_n_cb(backend, 1);
+                       {
+#if TARGET_OS_OSX
+                       int __ncb = 0;
+                       const char * __env_ncb = getenv("GGML_METAL_N_CB");
+                       if (__env_ncb) { __ncb = atoi(__env_ncb); }
+                       if (__ncb <= 0) {
+                           id<MTLDevice> __dev = ((struct ggml_backend_metal_device_context *)dev->context)->mtl_device;
+                           bool __is_discrete = !__dev.hasUnifiedMemory;
+#if defined(MTLDeviceLocationSlot)
+                           if ([__dev respondsToSelector:@selector(location)] && __dev.location == MTLDeviceLocationSlot) { __is_discrete = true; }
+#endif
+                           if ([__dev respondsToSelector:@selector(isRemovable)] && __dev.removable) { __is_discrete = true; }
+                           __ncb = __is_discrete ? 4 : 1;
+                       }
+                       ggml_backend_metal_set_n_cb(backend, __ncb);
+#else
+                       ggml_backend_metal_set_n_cb(backend, 1);
+#endif
+                   }
 
     return backend;
 }
@@ -6547,7 +6958,25 @@ static ggml_backend_t ggml_backend_metal_device_init(ggml_backend_dev_t dev, con
         /* .context   = */ ctx,
     };
 
-    ggml_backend_metal_set_n_cb(backend, 1);
+                       {
+#if TARGET_OS_OSX
+                       int __ncb = 0;
+                       const char * __env_ncb = getenv("GGML_METAL_N_CB");
+                       if (__env_ncb) { __ncb = atoi(__env_ncb); }
+                       if (__ncb <= 0) {
+                           id<MTLDevice> __dev = ((struct ggml_backend_metal_device_context *)dev->context)->mtl_device;
+                           bool __is_discrete = !__dev.hasUnifiedMemory;
+#if defined(MTLDeviceLocationSlot)
+                           if ([__dev respondsToSelector:@selector(location)] && __dev.location == MTLDeviceLocationSlot) { __is_discrete = true; }
+#endif
+                           if ([__dev respondsToSelector:@selector(isRemovable)] && __dev.removable) { __is_discrete = true; }
+                           __ncb = __is_discrete ? 4 : 1;
+                       }
+                       ggml_backend_metal_set_n_cb(backend, __ncb);
+#else
+                       ggml_backend_metal_set_n_cb(backend, 1);
+#endif
+                   }
 
     return backend;
 
@@ -6595,7 +7024,39 @@ static ggml_backend_buffer_t ggml_backend_metal_device_buffer_from_ptr(ggml_back
         ctx->buffers[ctx->n_buffers].metal = nil;
 
         if (size_aligned > 0) {
-            ctx->buffers[ctx->n_buffers].metal = [device newBufferWithBytesNoCopy:ptr length:size_aligned options:MTLResourceStorageModeShared deallocator:nil];
+            {
+
+                id<MTLBuffer> __src = [device newBufferWithBytesNoCopy:ptr length:size_aligned options:MTLResourceStorageModeShared deallocator:nil];
+                id<MTLBuffer> __dst = nil;
+#if TARGET_OS_OSX
+                bool __is_discrete = !device.hasUnifiedMemory;
+                // Robust detection for Mac Pro PCIe GPUs: some macOS builds may misreport hasUnifiedMemory.
+#if defined(MTLDeviceLocationSlot)
+                if ([device respondsToSelector:@selector(location)] && device.location == MTLDeviceLocationSlot) { __is_discrete = true; }
+#endif
+                if ([device respondsToSelector:@selector(isRemovable)] && device.removable) { __is_discrete = true; }
+#else
+                bool __is_discrete = false;
+#endif
+                if (__src && __is_discrete) {
+                    __dst = [device newBufferWithLength:size_aligned options:MTLResourceStorageModePrivate];
+                    id<MTLCommandQueue> __q = ctx_dev->mtl_queue_copy;
+                    if (__q == nil) { __q = [device newCommandQueue]; }
+                    id<MTLCommandBuffer> __cb = [__q respondsToSelector:@selector(commandBufferWithUnretainedReferences)] ? [__q commandBufferWithUnretainedReferences] : [__q commandBuffer];
+                    id<MTLBlitCommandEncoder> __blit = [__cb blitCommandEncoder];
+                    [__blit copyFromBuffer:__src sourceOffset:0 toBuffer:__dst destinationOffset:0 size:size_aligned];
+                    [__blit endEncoding];
+                    [__cb commit];
+                    [__cb waitUntilCompleted];
+                    if (ctx_dev->mtl_queue_copy == nil) { [__q release]; }
+                    [__src release];
+                    __src = nil;
+                    ctx->buffers[ctx->n_buffers].metal = __dst;
+                } else {
+                    ctx->buffers[ctx->n_buffers].metal = __src;
+                }
+            
+}
 
             if (ctx->buffers[ctx->n_buffers].metal == nil) {
                 GGML_LOG_ERROR("%s: error: failed to allocate buffer, size = %8.2f MiB\n", __func__, size_aligned / 1024.0 / 1024.0);
@@ -6621,7 +7082,36 @@ static ggml_backend_buffer_t ggml_backend_metal_device_buffer_from_ptr(ggml_back
             ctx->buffers[ctx->n_buffers].metal = nil;
 
             if (size_step_aligned > 0) {
-                ctx->buffers[ctx->n_buffers].metal = [device newBufferWithBytesNoCopy:(void *) ((uint8_t *) ptr + i) length:size_step_aligned options:MTLResourceStorageModeShared deallocator:nil];
+                    {
+        id<MTLBuffer> __src = [device newBufferWithBytesNoCopy:(void *) ((uint8_t *) ptr + i) length:size_step_aligned options:MTLResourceStorageModeShared deallocator:nil];
+        id<MTLBuffer> __dst = nil;
+#if TARGET_OS_OSX
+                bool __is_discrete = !device.hasUnifiedMemory;
+                // Robust detection for Mac Pro PCIe GPUs: some macOS builds may misreport hasUnifiedMemory.
+#if defined(MTLDeviceLocationSlot)
+                if ([device respondsToSelector:@selector(location)] && device.location == MTLDeviceLocationSlot) { __is_discrete = true; }
+#endif
+                if ([device respondsToSelector:@selector(isRemovable)] && device.removable) { __is_discrete = true; }
+#else
+        bool __is_discrete = false;
+#endif
+        if (__src && __is_discrete) {
+            __dst = [device newBufferWithLength:size_step_aligned options:MTLResourceStorageModePrivate];
+            id<MTLCommandQueue> __q = ctx_dev->mtl_queue_copy;
+                    if (__q == nil) { __q = [device newCommandQueue]; }
+            id<MTLCommandBuffer> __cb = [__q respondsToSelector:@selector(commandBufferWithUnretainedReferences)] ? [__q commandBufferWithUnretainedReferences] : [__q commandBuffer];
+            id<MTLBlitCommandEncoder> __blit = [__cb blitCommandEncoder];
+            [__blit copyFromBuffer:__src sourceOffset:0 toBuffer:__dst destinationOffset:0 size:size_step_aligned];
+            [__blit endEncoding];
+            [__cb commit];
+            [__cb waitUntilCompleted];
+            if (ctx_dev->mtl_queue_copy == nil) { [__q release]; }
+            [__src release];
+            ctx->buffers[ctx->n_buffers].metal = __dst;
+        } else {
+            ctx->buffers[ctx->n_buffers].metal = __src;
+        }
+    }
 
                 if (ctx->buffers[ctx->n_buffers].metal == nil) {
                     GGML_LOG_ERROR("%s: error: failed to allocate buffer, size = %8.2f MiB\n", __func__, size_step_aligned / 1024.0 / 1024.0);
