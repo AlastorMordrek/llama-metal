@@ -7,7 +7,7 @@ This fork patches the Metal backend to work correctly on these machines.
 
 **One command install:**
 ```bash
-curl -sSL https://raw.githubusercontent.com/AlastorMordrek/llama-metal/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/AlastorMordrek/llama-metal/refs/heads/main/install.sh | bash
 ```
 
 ## What you get
