@@ -112,14 +112,17 @@ if brew list libomp &>/dev/null 2>&1; then
     OMP_FLAG="-DOpenMP_ROOT=$(brew --prefix)/opt/libomp"
 fi
 
+echo "  Configuring..."
 cmake -S "$SCRIPT_DIR" -B "$BUILD_DIR" \
     -DCMAKE_BUILD_TYPE=Release \
     $METAL_FLAGS \
     $OMP_FLAG \
-    -DGGML_NATIVE=ON 2>&1 | tail -3
+    -DGGML_NATIVE=ON
 
+echo ""
+echo "  Compiling..."
 NCPU="$(sysctl -n hw.ncpu)"
-cmake --build "$BUILD_DIR" -j"$NCPU" 2>&1 | tail -5
+cmake --build "$BUILD_DIR" -j"$NCPU"
 
 echo ""
 echo "Build complete."
