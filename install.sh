@@ -1,6 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# When piped from stdin (curl | bash), BASH_SOURCE[0] is empty.
+# Clone the repo locally and re-execute from there.
+if [ -z "${BASH_SOURCE[0]:-}" ] || [ ! -f "$(dirname "${BASH_SOURCE[0]:-$PWD}")/CMakeLists.txt" ]; then
+    TARGET="${LLAMA_METAL_DIR:-$HOME/llama-metal}"
+    echo "=== llama-metal Installer ==="
+    echo ""
+    echo "Downloading to $TARGET..."
+    mkdir -p "$(dirname "$TARGET")"
+    git clone --depth=1 https://github.com/AlastorMordrek/llama-metal.git "$TARGET"
+    cd "$TARGET"
+    exec bash install.sh
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
